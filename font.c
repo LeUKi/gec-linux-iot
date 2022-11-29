@@ -1,0 +1,812 @@
+#include "font.h"
+#include "EdpKit.h"
+#include "ConnectOneNet.h"
+
+unsigned char lcd_buf[800 * 480 * 4] = {0};
+char tbuf[20] = {0};
+int jpg_num = 0;
+char pic_name[512];
+extern int lcd_fd, ts_fd, leds_fd, buzz_fd, sr04_fd, dht11_fd, light_fd;
+extern int *lcd_ptr;
+extern pthread_t tid1, tid2, camera_tid, rec_tid, loading_tid, ledw_tid, buzz_tid, sr04_tid, dht11_tid, light_tid;
+extern struct buffer jpeg_buf;
+font *f = NULL;
+bitmap *bp = NULL;
+int av_fd;
+//播放器初始化
+void mplayer_init()
+{
+    //在临时目录创建管道文件
+    if (access("/tmp/fifo", F_OK))
+    {
+        mkfifo("/tmp/fifo", 0777);
+    }
+
+    //打开管道文件
+    av_fd = open("/tmp/fifo", O_RDWR);
+}
+
+void gettime(char *buf)
+{
+    time_t timep;
+    int s = time(&timep);
+    sprintf(buf, "%d", s);
+}
+//发送指令
+void send_cmd(char *cmd)
+{
+    write(av_fd, cmd, strlen(cmd));
+}
+
+//画点
+int lcd_draw_point(int i, int j, int color)
+{
+    *(lcd_ptr + 800 * j + i) = color;
+}
+
+int lcd_draw_bmp(const char *pathname, int x, int y, int w, int h)
+{
+    int i, j;
+
+    // a 打开图片文件
+
+    int bmp_fd = open(pathname, O_RDWR);
+
+    //错误处理
+
+    if (bmp_fd == -1)
+    {
+        printf("open bmp file failed!\n");
+        return -1;
+    }
+
+    // 2，将图片数据加载到lcd屏幕
+    char header[54];
+    char rgb_buf[w * h * 3];
+    // a 将图片颜色数据读取出来
+
+    int pad = (4 - (w * 3) % 4) % 4; //计算每一行的无效字节数
+
+    read(bmp_fd, header, 54);
+    // read(bmp_fd, rgb_buf, w*h*3);
+
+    for (i = 0; i < h; i++)
+    {
+        read(bmp_fd, &rgb_buf[w * i * 3], w * 3);
+        lseek(bmp_fd, pad, SEEK_CUR);
+    }
+
+    for (j = 0; j < h; j++)
+    {
+        for (i = 0; i < w; i++)
+        {
+            int b = rgb_buf[(j * w + i) * 3 + 0];
+            int g = rgb_buf[(j * w + i) * 3 + 1];
+            int r = rgb_buf[(j * w + i) * 3 + 2];
+
+            int color = b;
+            color |= (g << 8);
+            color |= (r << 16);
+
+            //*(lcd_ptr+800*j+i) = color;
+            lcd_draw_point(i + x, h - 1 - j + y, color);
+        }
+    }
+
+    // 3，关闭文件
+    // a 关闭图片文件
+    close(bmp_fd);
+
+    return 0;
+}
+
+struct my_error_mgr
+{
+    struct jpeg_error_mgr pub; /* "public" fields */
+
+    jmp_buf setjmp_buffer; /* for return to caller */
+};
+
+typedef struct my_error_mgr *my_error_ptr;
+
+/*
+ * Here's the routine that will replace the standard error_exit method:
+ */
+
+METHODDEF(void)
+my_error_exit(j_common_ptr cinfo)
+{
+    /* cinfo->err really points to a my_error_mgr struct, so coerce pointer */
+    my_error_ptr myerr = (my_error_ptr)cinfo->err;
+
+    /* Always display the message. */
+    /* We could postpone this until after returning, if we chose. */
+    (*cinfo->err->output_message)(cinfo);
+
+    /* Return control to the setjmp point */
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+/* lcd_draw_jpeg        : 指定静态/动态图像数据显示
+ * int x, int y         : 图像显示起点位置
+ * const char *pathname : 指定静态数据源  （例如 图片文件）
+ * char *jpeg_buf       : 指定动态数据源  （例如 摄像头获取到的数据）
+ * int jpeg_size        : 动态数据的大小
+ * int zoom_flag        : 缩放比例     （分子：1/分母：zoom_flag，例如1/2缩小一倍）
+ */
+int img_fd;
+
+unsigned char *argb_buf = lcd_buf;
+// jpeg解压缩对象和错误处理对象
+struct jpeg_decompress_struct cinfo;
+struct my_error_mgr jerr;
+struct stat statbuf;
+int lcd_draw_jpeg(int x, int y, char *pathname, char *jpeg_buf1, int jpeg_size, int zoom_flag)
+{
+    char *img_buf;
+    int img_size;
+    int x_c = x;
+    if (pathname != NULL)
+    {
+        // 打开图片文件
+        img_fd = open(pathname, O_RDWR);
+        // puts("//153");
+        if (img_fd == -1)
+        {
+            printf("open jpeg file [ %s ] failed !\n", pathname);
+            return -1;
+        }
+
+        //获取文件大小
+        fstat(img_fd, &statbuf);
+
+        img_size = statbuf.st_size;
+
+        img_buf = calloc(1, img_size);
+
+        read(img_fd, img_buf, img_size);
+        // puts("//168");
+    }
+    else
+    {
+        img_size = jpeg_size;
+        img_buf = jpeg_buf1;
+    }
+    /* Step 1: 分配并初始化jpeg解压缩对象 */
+    // if (pathname != NULL)
+    // puts("//177");
+
+    //错误处理
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = my_error_exit;
+
+    if (setjmp(jerr.setjmp_buffer))
+    {
+        //释放资源
+        jpeg_destroy_decompress(&cinfo);
+        if (pathname != NULL)
+        {
+            close(img_fd);
+        }
+        return -1;
+    }
+    // if (pathname != NULL)
+    // puts("//193");
+    //初始化解压缩对象
+    jpeg_create_decompress(&cinfo);
+
+    /* Step 2: 指定解压缩数据源 (eg, a file) */
+
+    jpeg_mem_src(&cinfo, img_buf, img_size);
+
+    /* Step 3: 读取图片文件的详细信息 */
+    (void)jpeg_read_header(&cinfo, TRUE);
+    // if (pathname == NULL)
+    // puts("//205");
+    /* Step 4: 解压缩的参数设置，一般默认 */
+    cinfo.scale_num = 1; // 1
+                         // if (pathname == NULL)
+    // puts("//209");
+    cinfo.scale_denom = zoom_flag; //
+                                   // if (pathname == NULL)
+    // puts("//212");
+    /* Step 5: 开始解压 */
+    (void)jpeg_start_decompress(&cinfo);
+
+    int i, r, g, b, color;
+    // if (pathname == NULL)
+    // puts("//218");
+    /* Step 6: 取出数据 */
+    // cinfo.output_scanline：当前行号
+    // cinfo.output_height：对应的图片的高
+    // cinfo.output_width：对应的图片的宽
+    while (cinfo.output_scanline < cinfo.output_height)
+    {
+        argb_buf = lcd_buf;
+        //每次读取一行的数据
+        (void)jpeg_read_scanlines(&cinfo, (JSAMPARRAY)&argb_buf, 1);
+
+        for (i = 0; i < cinfo.output_width; i++)
+        {
+            b = *(argb_buf + 2);
+            g = *(argb_buf + 1);
+            r = *(argb_buf + 0);
+
+            //合并
+            color = b;
+            color |= (g << 8);
+            color |= (r << 16);
+
+            lcd_draw_point(x, y, color);
+
+            argb_buf += 3;
+            x++;
+        }
+        y++;
+        x = x_c;
+    }
+    /* Step 7: 解压完毕 */
+    (void)jpeg_finish_decompress(&cinfo);
+    // if (pathname != NULL)
+    // puts("//248");
+    /* Step 8: 释放资源 */
+    jpeg_destroy_decompress(&cinfo);
+
+    if (pathname != NULL)
+    {
+        close(img_fd);
+    }
+
+    return 0;
+}
+
+int dev_init(void)
+{
+    lcd_fd = open("/dev/fb0", O_RDWR);
+
+    //错误处理
+    if (lcd_fd == -1)
+    {
+        printf("open lcd device failed!\n");
+        return -1;
+    }
+
+    // 2,为lcd设备建立内存映射关系
+    lcd_ptr = mmap(NULL, 800 * 480 * 4, PROT_READ | PROT_WRITE, MAP_SHARED, lcd_fd, 0);
+
+    if (lcd_ptr == MAP_FAILED)
+    {
+        printf("mmap failed!\n");
+        return -2;
+    }
+
+    //清除屏幕
+    memset(lcd_ptr, 0, 800 * 480 * 4);
+
+    // 3，打开触摸屏设备
+
+    ts_fd = open("/dev/input/event0", O_RDWR);
+
+    //错误处理
+    if (lcd_fd == -1)
+    {
+        printf("open ts device failed!\n");
+        return -3;
+    }
+
+    // 4，打开摄像头设备
+
+    // if (0 == (linux_v4l2_device_open(DEV_CAMERA0)))
+    // {
+    //     printf("DEV_CAMERA0 ok\n");
+    // }
+    // else
+    if (0 == (linux_v4l2_device_open(DEV_CAMERA7)))
+    {
+        printf("DEV_CAMERA7 ok\n");
+    }
+    // else
+    // {
+    //     printf("DEV_CAMERA fail\n");
+    //     return -4;
+    // }
+    // 1，设备初始化
+
+    linux_v4l2_device_init(&jpeg_buf);
+
+    mplayer_init();
+
+    leds_fd = open("/dev/leds_misc", O_RDWR);
+    buzz_fd = open("/dev/buzz_misc", O_RDWR);
+    f = fontLoad("./font/mk.ttf");
+
+    return 0;
+}
+
+void dev_uninit(void)
+{
+    destroyBitmap(bp);
+    fontUnload(f);
+    munmap(lcd_ptr, 800 * 480 * 4);
+    close(lcd_fd);
+    close(ts_fd);
+    linux_v4l2_device_close();
+}
+
+int fontdraw(char *str, s32 s, u32 x, u32 y, int w, int h, color c, color bgc)
+{
+    /* 1, 打开设备文件 */
+    if (lcd_fd == -1)
+    {
+        printf("open lcd device failed!\n");
+    }
+
+    /* 建立内存映射 */
+    // lcd_ptr = mmap(NULL, 800 * 480 * 4, PROT_READ | PROT_WRITE, MAP_SHARED, lcd_fd, 0);
+    if (lcd_ptr == MAP_FAILED)
+    {
+        /* if (lcd_ptr == (void*)-1) {*/
+        printf("mmap failed!\n");
+    }
+
+    if (f == NULL)
+    {
+        printf("font load failed!\n");
+        return -1;
+    }
+    fontSetSize(f, s);
+    bp = createBitmapWithInit(w, h, 4, bgc);
+    if (bp == NULL)
+    {
+        printf("create bitmap failed!\n");
+        return -1;
+    }
+    /* 显示海大的字样 */
+    fontPrint(f, bp, 0, 0, str, c, w);
+    show_font_to_lcd(lcd_ptr, x, y, bp);
+
+    // munmap(lcd_ptr, 800 * 480 * 4);
+    return 0;
+}
+
+void pngdraw(char *pathname, u32 x, u32 y)
+{
+    png_display(pathname, x, y, (char *)lcd_ptr);
+}
+
+void *read_camera_data(void *arg)
+{
+    pthread_detach(pthread_self());
+
+    // 2，开启捕捉
+
+    while (1)
+    {
+        // pthread_testcancel();
+
+        // if (camera_flag == 1) {
+        // 3，获取摄像头捕捉的画面
+        linux_v4l2_device_get_frame(&jpeg_buf);
+
+        // 4, yuyv格式转换jpeg
+        // yuyv2jpeg(jpeg_buf.start, jpeg_buf.length, 9);
+
+        // 5，显示摄像头捕捉的画面
+        lcd_draw_jpeg(0, 0, NULL, jpeg_buf.start, jpeg_buf.length, 1);
+    }
+}
+extern int sockfd;
+void snapcamera(void)
+{
+    bzero(pic_name, 512);
+    char pic_name1[256] = {0};
+    gettime(pic_name1);
+    sprintf(pic_name, "ps/%s.jpg", pic_name1);
+    puts(pic_name);
+    int pic_fd = open(pic_name, O_RDWR | O_CREAT | O_TRUNC, 0777);
+    puts("1");
+    if (-1 == pic_fd)
+    {
+        perror("create jpg failed");
+        return;
+    }
+    write(pic_fd, jpeg_buf.start, jpeg_buf.length);
+    close(pic_fd);
+
+    int base64_len = jpeg_buf.length / 3 * 4 + (jpeg_buf.length % 3 != 0) * 4 + 1;
+    char base64[base64_len];
+    memset(base64, '\0', sizeof(char) * base64_len);
+    base64Encode(jpeg_buf.start, jpeg_buf.length, base64);
+    puts("1");
+
+    EdpPacket *send_pkg = PacketSavedataString(kTypeSimpleJsonWithoutTime, DEVICE_ID, "asda", base64, 0, 0);
+
+    puts("1");
+    int ret = send(sockfd, send_pkg->_data, send_pkg->_write_pos, 0); //发送数据到平台
+    puts("1");
+
+    DeleteBuffer(&send_pkg);
+    printf("ret = %d\n", ret);
+
+    // sleep(4);
+    // lcd_draw_jpeg(680, 380, NULL, jpeg_buf.start, jpeg_buf.length, 8);
+    // lcd_draw_jpeg(640, 360, pic_name, NULL, 0, 8);
+}
+
+int read_dir(const char *pathname, char (*files)[4096], char *type, int *len)
+{
+    int length = *len;
+    DIR *dirp = opendir(pathname);
+
+    if (dirp == NULL)
+    {
+        printf("open dir failed!\n");
+        return -1;
+    }
+
+    // chdir(pathname);
+
+    char buf[4096];
+
+    while (1)
+    {
+        struct dirent *dt = readdir(dirp);
+
+        if (dt == NULL)
+        {
+            *len = length;
+            break;
+        }
+
+        if (!strncmp(dt->d_name, ".", 1) || !strncmp(dt->d_name, "..", 2))
+        {
+            continue;
+        }
+
+        sprintf(buf, "%s/%s", pathname, dt->d_name);
+
+        if (dt->d_type == DT_DIR)
+        {
+            // printf("dir name : %s\n", buf);
+            read_dir(buf, files, type, len);
+        }
+        else if (dt->d_type == DT_REG)
+        {
+            // printf("reg name : %s\n", buf);
+            if (!strncmp(buf + (strlen(buf) - strlen(type)), type, strlen(type)))
+            {
+                strncpy(files[length++], buf, strlen(buf));
+            }
+        }
+    }
+}
+int read_ab_dir(const char *pathname, char (*files)[4096], int *len)
+{
+    int length = *len;
+    DIR *dirp = opendir(pathname);
+
+    if (dirp == NULL)
+    {
+        printf("open dir failed!\n");
+        return -1;
+    }
+
+    // chdir(pathname);
+
+    char buf[4096];
+
+    while (1)
+    {
+        struct dirent *dt = readdir(dirp);
+
+        if (dt == NULL)
+        {
+            *len = length;
+            break;
+        }
+
+        if (!strncmp(dt->d_name, ".", 1) || !strncmp(dt->d_name, "..", 2))
+        {
+            continue;
+        }
+
+        sprintf(buf, "%s/%s", pathname, dt->d_name);
+
+        if (dt->d_type == DT_DIR)
+        {
+            // printf("dir name : %s\n", buf);
+            read_ab_dir(buf, files, len);
+        }
+        else if (dt->d_type == DT_REG)
+        {
+            // printf("reg name : %s\n", buf);
+            if (!strncmp(buf + (strlen(buf) - strlen(".jpg")), ".jpg", strlen(".jpg")))
+            {
+                strncpy(files[length++], buf, strlen(buf));
+            }
+            if (!strncmp(buf + (strlen(buf) - strlen(".avi")), ".avi", strlen(".avi")))
+            {
+                strncpy(files[length++], buf, strlen(buf));
+            }
+        }
+    }
+}
+
+void *record_jpg(void *arg)
+{
+    pthread_detach(pthread_self());
+    u8 i = 0;
+    system("mkdir tmp & rm tmp/* -r");
+    char pathname[4096];
+    while (1)
+    {
+        pthread_testcancel();
+        /* 保存一帧的数据 */
+        sprintf(pathname, "tmp/%d.jpg", i);
+        int jpg_fd = open(pathname, O_RDWR | O_CREAT | O_TRUNC, 0777);
+        write(jpg_fd, jpeg_buf.start, jpeg_buf.length);
+        close(jpg_fd);
+        i++;
+        usleep(40000);
+    }
+}
+int file_exist(const char *path)
+{
+    DIR *dp;
+    if ((dp = opendir(path)) == NULL)
+    {
+        return 0;
+    }
+    else
+    {
+        closedir(dp);
+        return 1;
+    }
+}
+void *wait_makeavi(void *arg)
+{
+    pthread_detach(pthread_self());
+    char *loadp[] = {
+        "bg/l0.png",
+        "bg/l1.png",
+        "bg/l2.png",
+        "bg/l3.png",
+    };
+    int k = 0;
+    while (1)
+    {
+        // puts("==========");
+        pngdraw(loadp[k], 272, 112);
+        pthread_testcancel();
+        k++;
+        if (k == 4)
+        {
+            k = 0;
+        }
+        usleep(200000);
+    }
+}
+extern int LIGHT_sw;
+void *ledwater(void *arg)
+{
+    pthread_detach(pthread_self());
+    int water[][4] = {
+        {0, 0, 0, 0},
+        {1, 0, 0, 0},
+        {1, 1, 0, 0},
+        {0, 1, 1, 0},
+        {0, 0, 1, 1},
+        {0, 0, 0, 1},
+    };
+    int i = 0;
+    while (1)
+    {
+        pthread_testcancel();
+        if (LIGHT_sw == 0)
+        {
+            ioctl(leds_fd, LED1, 1);
+            ioctl(leds_fd, LED2, 1);
+            ioctl(leds_fd, LED3, 1);
+            ioctl(leds_fd, LED4, 1);
+            continue;
+        }
+        if (i == 6)
+        {
+            i = 0;
+        }
+        // puts("=======================================");
+        // printf("%d", water[i][0]);
+        // puts("=======================================");
+        ioctl(leds_fd, LED1, water[i][0]);
+        ioctl(leds_fd, LED2, water[i][1]);
+        ioctl(leds_fd, LED3, water[i][2]);
+        ioctl(leds_fd, LED4, water[i][3]);
+        usleep(40000);
+        i++;
+    }
+}
+int canbb = 1;
+void *bb(void *arg)
+{
+
+    pthread_detach(pthread_self());
+    int d = *(int *)arg;
+    int ts[] = {5000, 10000, 5000, d};
+    bool s = true;
+    for (int i = 0; i < 4; i++)
+    {
+        ioctl(buzz_fd, s ? BUZZ_ON : BUZZ_OFF);
+        s = !s;
+
+        usleep(ts[i]);
+    }
+    ioctl(buzz_fd, BUZZ_OFF);
+
+    canbb = 1;
+    pthread_exit(NULL);
+}
+
+void *getenv_sr04(void *arg)
+{
+    pthread_detach(pthread_self());
+    int ret;
+    unsigned int dest;
+    char buf[4096];
+    int t;
+    canbb = 1;
+    while (1)
+    {
+        pthread_testcancel();
+        ret = read(sr04_fd, &dest, sizeof(unsigned int));
+
+        if (ret < 0)
+        {
+            sprintf(buf, "测距 --", dest);
+            // printf("read again\n");
+        }
+        else
+        {
+            sprintf(buf, "测距 %ucm", dest);
+            send_onenet("dest", (int)dest);
+            // printf("dest = %ucm %d\n", dest, dest);
+            if (dest < 200 && canbb == 1)
+            {
+                canbb = 0;
+                if (dest > 100)
+                {
+                    t = 1000 * 1000;
+                }
+                else
+                {
+                    t = dest * 10000;
+                }
+
+                pthread_create(&buzz_tid, NULL, bb, &t);
+            }
+        }
+        if (dest > 200)
+        {
+            fontdraw(buf, 50, 30, 400, 210, 50, 0, 0xffffffff);
+        }
+        else if (dest > 100)
+        {
+            fontdraw(buf, 50, 30, 400, 210, 50, 0x00ff0000, 0xffffffff);
+        }
+        else
+        {
+            fontdraw(buf, 50, 30, 400, 210, 50, 0xff000000, 0xffffffff);
+        }
+
+        usleep(200 * 1000); // 200ms
+    }
+}
+void *getenv_dht11(void *arg)
+{
+    pthread_detach(pthread_self());
+    int ret;
+    unsigned char data[2];
+    char buf[4096];
+
+    while (1)
+    {
+        pthread_testcancel();
+        ret = ioctl(dht11_fd, GEC6818_GET_DHTDATA, &data[0]);
+        printf("%d/%hhd/%hhd\n", ret, data[0], data[1]);
+        if (ret != 0)
+        {
+            fontdraw("      读取中", 50, 270, 400, 260, 50, 0, 0xffffffff);
+        }
+        else
+        {
+            sprintf(buf, "湿 %hhd / 温 %hhd", data[1], data[0]);
+            puts(buf);
+            fontdraw(buf, 50, 290, 400, 240, 50, 0xffffffff, 0);
+        }
+        usleep(1000 * 2000);
+    }
+};
+void *getenv_light(void *arg)
+{
+    pthread_detach(pthread_self());
+    int ret;
+    int light_flag = 0;
+
+    while (1)
+    {
+        pthread_testcancel();
+        ret = read(light_fd, &light_flag, 4);
+
+        if (ret < 0)
+        {
+            fontdraw("    读取中", 50, 560, 400, 210, 50, 0, 0xffffffff);
+        }
+        else
+        {
+            // printf("light_flag = %d\n", light_flag);
+
+            if (light_flag == 0)
+            {
+                fontdraw("       暗", 50, 560, 400, 210, 50, 0xffffffff, 0);
+            }
+            else if (light_flag == 1)
+            {
+                fontdraw("       亮", 50, 560, 400, 210, 50, 0, 0xffffffff);
+            }
+            send_onenet("light", light_flag);
+        }
+        usleep(300 * 1000);
+    }
+};
+
+void send_onenet(char *tag, int num)
+{
+    //发送数据给 OneNet 平台
+    memset(tbuf, 0, sizeof(tbuf));
+    // printf("=========================\n");
+    OneNet_SendData(tbuf, tag, num);
+}
+const char *MAP_TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+void base64Encode(UCHAR *buf, int buf_size, char *base64)
+{
+#ifdef DEBUG
+    printf("----------------------------------------------------\n");
+    printf("buf-size = %d\n", buf_size);
+#endif // DEBUG
+    UCHAR tmp[3];
+    int i;
+    for (i = 0; i < buf_size / 3; i++)
+    {
+        tmp[0] = buf[i * 3];
+        tmp[1] = buf[i * 3 + 1];
+        tmp[2] = buf[i * 3 + 2];
+        base64[i * 4] = MAP_TABLE[tmp[0] >> 2];
+        base64[i * 4 + 1] = MAP_TABLE[(tmp[0] << 4 | tmp[1] >> 4) & 0x3F];
+        base64[i * 4 + 2] = MAP_TABLE[(tmp[1] << 2 | tmp[2] >> 6) & 0x3F];
+        base64[i * 4 + 3] = MAP_TABLE[tmp[2] & 0x3F];
+#ifdef DEBUG
+        printf("buf data : %x %x %x\n", tmp[0], tmp[1], tmp[2]);
+        printf("=> %c%c%c%c\n", base64[i * 4], base64[i * 4 + 1], base64[i * 4 + 2], base64[i * 4 + 3]);
+#endif // DEBUG
+    }
+    if (buf_size % 3 == 2)
+    {
+        tmp[0] = buf[i * 3];
+        tmp[1] = buf[i * 3 + 1];
+        base64[i * 4] = MAP_TABLE[tmp[0] >> 2];
+        base64[i * 4 + 1] = MAP_TABLE[(tmp[0] << 4 | tmp[1] >> 4) & 0x3F];
+        base64[i * 4 + 2] = MAP_TABLE[(tmp[1] << 2) & 0x3F];
+        base64[i * 4 + 3] = '=';
+    }
+    else if (buf_size % 3 == 1)
+    {
+        tmp[0] = buf[i * 3];
+        base64[i * 4] = MAP_TABLE[tmp[0] >> 2];
+        base64[i * 4 + 1] = MAP_TABLE[(tmp[0] << 4) & 0x3F];
+        base64[i * 4 + 2] = '=';
+        base64[i * 4 + 3] = '=';
+    }
+#ifdef DEBUG
+    printf("----------------------------------------------------\n");
+#endif // DEBUG
+}
